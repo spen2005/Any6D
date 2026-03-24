@@ -225,3 +225,127 @@ class ScorePredictor:
 
     return scores, None
 
+  @torch.inference_mode()
+  def predict2(self, rgb, depth, K, ob_in_cams, gt_mask, mesh, normal_map=None, get_vis=False, 
+              mesh_tensors=None, glctx=None, mesh_diameter=None):
+      '''
+      Compute IOU between rendered pose masks and ground truth mask
+      
+      @rgb: np array (H,W,3) - input RGB image
+      @depth: np array (H,W) - input depth map
+      @K: camera intrinsics matrix (3,3)
+      @ob_in_cams: np array (N,4,4) - object poses in camera frame
+      @gt_mask: np array (H,W) - ground truth binary mask
+      @mesh: trimesh object
+      @mesh_tensors: precomputed mesh tensors for rendering
+      @glctx: nvdiffrast GL context
+      @mesh_diameter: float - mesh diameter for normalization
+      @get_vis: bool - whether to return visualization
+      
+      Returns:
+          scores: torch.Tensor (N,) - IOU scores for each pose
+          canvas: np.array or None - visualization if get_vis=True
+      '''
+      
+      ob_in_cams = torch.as_tensor(ob_in_cams, dtype=torch.float, device='cuda')
+      gt_mask = torch.as_tensor(gt_mask, device='cuda', dtype=torch.float)
+      H, W = gt_mask.shape[:2]
+      
+      if mesh_tensors is None:
+          mesh_tensors = make_mesh_tensors(mesh)
+      
+      # Render masks for all poses
+      B = len(ob_in_cams)
+      bs = 512
+      rendered_masks = []
+      
+      for b in range(0, B, bs):
+          batch_poses = ob_in_cams[b:b+bs]
+          
+          # Render depth maps for the batch
+          _, depth_render, _ = nvdiffrast_render(
+              K=K, H=H, W=W, 
+              ob_in_cams=batch_poses, 
+              context='cuda',
+              get_normal=False,
+              glctx=glctx,
+              mesh_tensors=mesh_tensors,
+              output_size=(H, W),
+              use_light=False
+          )
+          
+          # Convert depth to binary mask (depth > 0 means object is visible)
+          mask_batch = (depth_render > 0).float()
+          rendered_masks.append(mask_batch)
+      
+      rendered_masks = torch.cat(rendered_masks, dim=0)  # (B, H, W)
+      
+      # Compute IOU for each pose
+      scores = []
+      gt_mask_expanded = gt_mask[None, :, :].expand(B, -1, -1)
+      
+      for i in range(B):
+          pred_mask = rendered_masks[i]
+          gt = gt_mask_expanded[i]
+          
+          # Compute intersection and union
+          intersection = (pred_mask * gt).sum()
+          union = ((pred_mask + gt) > 0).float().sum()
+          
+          # Compute IOU, handle division by zero
+          if union > 0:
+              iou = intersection / union
+          else:
+              iou = torch.tensor(0.0, device='cuda')
+          
+          scores.append(iou)
+      
+      scores = torch.stack(scores, dim=0)
+      
+      torch.cuda.empty_cache()
+      
+      if get_vis:
+          # Create visualization similar to vis_batch_data_scores
+          canvas = []
+          ids = scores.argsort(descending=True)
+          pad_margin = 5
+          
+          for idx in ids[:20]:  # Show top 20 results
+              # Render RGB for visualization
+              rgb_render, _, _ = nvdiffrast_render(
+                  K=K, H=H, W=W,
+                  ob_in_cams=ob_in_cams[idx:idx+1],
+                  context='cuda',
+                  get_normal=False,
+                  glctx=glctx,
+                  mesh_tensors=mesh_tensors,
+                  output_size=(H, W),
+                  use_light=True
+              )
+              
+              rgb_vis = (rgb_render[0].data.cpu().numpy() * 255).astype(np.uint8)
+              mask_vis = (rendered_masks[idx].data.cpu().numpy() * 255).astype(np.uint8)
+              mask_vis = cv2.cvtColor(mask_vis, cv2.COLOR_GRAY2BGR)
+              gt_mask_vis = (gt_mask.data.cpu().numpy() * 255).astype(np.uint8)
+              gt_mask_vis = cv2.cvtColor(gt_mask_vis, cv2.COLOR_GRAY2BGR)
+              
+              # Create row with rendered RGB, predicted mask, GT mask
+              pad = np.ones((H, pad_margin, 3), dtype=np.uint8) * 255
+              row = np.concatenate([rgb_vis, pad, mask_vis, pad, gt_mask_vis], axis=1)
+              
+              # Resize for display
+              s = 100 / row.shape[0]
+              row = cv2.resize(row, fx=s, fy=s, dsize=None)
+              
+              # Add text with ID and score
+              row = cv_draw_text(row, text=f'id:{idx}, IOU:{scores[idx]:.3f}', 
+                              uv_top_left=(10, 10), color=(0, 255, 0), fontScale=0.5)
+              
+              canvas.append(row)
+              pad = np.ones((pad_margin, row.shape[1], 3), dtype=np.uint8) * 255
+              canvas.append(pad)
+          
+          canvas = np.concatenate(canvas, axis=0).astype(np.uint8)
+          return scores, canvas
+      
+      return scores, None
